@@ -1,6 +1,7 @@
 package text
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/slack-go/slack"
@@ -136,7 +137,7 @@ func TestBlocksToText(t *testing.T) {
 					},
 				},
 			},
-			want: "Click here",
+			want: "Click https://example.com - here",
 		},
 		{
 			name: "rich text link without display text falls back to URL",
@@ -258,6 +259,166 @@ func TestBlocksToText(t *testing.T) {
 			got := BlocksToText(tt.blocks)
 			if got != tt.want {
 				t.Errorf("BlocksToText() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// botNotificationJSON mimics a deploy bot notification: the text field is a
+// one-line fallback, the content is in section blocks and the links are on
+// buttons.
+const botNotificationJSON = `{
+	"type": "message",
+	"subtype": "bot_message",
+	"ts": "1793862623.476639",
+	"text": "Инициирован canary-этап.",
+	"blocks": [
+		{"type": "section", "text": {"type": "mrkdwn", "text": ":information_source: Инициирован canary-этап."}},
+		{"type": "section", "fields": [
+			{"type": "mrkdwn", "text": "*Task*\n<https://jira.example.com/browse/CD-1|[CD-1] Задача>"},
+			{"type": "mrkdwn", "text": "*Инициатор*\n<@U123>"}
+		]},
+		{"type": "section", "text": {"type": "mrkdwn", "text": "Скоро потребуется ручной Approve/Decline"},
+			"accessory": {"type": "button", "text": {"type": "plain_text", "text": "Grafana"}, "url": "https://grafana.example.com/d/1?a=1&b=2"}},
+		{"type": "actions", "elements": [
+			{"type": "button", "text": {"type": "plain_text", "text": "Панель управления"}, "url": "https://deploy.example.com/panel/1"},
+			{"type": "button", "text": {"type": "plain_text", "text": "Approve"}, "action_id": "approve", "value": "1"}
+		]}
+	]
+}`
+
+func TestUnitMessageTextBotNotification(t *testing.T) {
+	var msg slack.Message
+	if err := json.Unmarshal([]byte(botNotificationJSON), &msg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	t.Run("history fallback is replaced by blocks", func(t *testing.T) {
+		got := ProcessText(MessageText(msg.Text, msg.Blocks))
+		want := ":information_source: Инициирован canary-этап. " +
+			"*Task*\nhttps://jira.example.com/browse/CD-1 - [CD-1] Задача, " +
+			"*Инициатор*\n<@U123> " +
+			"Скоро потребуется ручной Approve/Decline " +
+			"https://grafana.example.com/d/1?a=1&b=2 - Grafana " +
+			"https://deploy.example.com/panel/1 - Панель управления"
+		if got != want {
+			t.Errorf("MessageText() =\n%q\nwant\n%q", got, want)
+		}
+	})
+
+	t.Run("search text in another order gets only button links", func(t *testing.T) {
+		searchText := ":information_source: Инициирован canary-этап. *Скоро потребуется ручной Approve/Decline " +
+			"*Task*\n<https://jira.example.com/browse/CD-1|[CD-1] Задача> *Инициатор*\n<@U123>"
+		got := ProcessText(MessageText(searchText, msg.Blocks))
+		want := ":information_source: Инициирован canary-этап. *Скоро потребуется ручной Approve/Decline " +
+			"*Task*\nhttps://jira.example.com/browse/CD-1 - [CD-1] Задача, *Инициатор*\n<@U123>\n" +
+			"https://grafana.example.com/d/1?a=1&b=2 - Grafana " +
+			"https://deploy.example.com/panel/1 - Панель управления"
+		if got != want {
+			t.Errorf("MessageText() =\n%q\nwant\n%q", got, want)
+		}
+	})
+}
+
+func TestUnitMessageText(t *testing.T) {
+	section := func(s string) slack.Block {
+		return &slack.SectionBlock{Type: slack.MBTSection, Text: &slack.TextBlockObject{Type: "mrkdwn", Text: s}}
+	}
+	richText := func(elems ...slack.RichTextSectionElement) slack.Block {
+		return &slack.RichTextBlock{
+			Type:     slack.MBTRichText,
+			Elements: []slack.RichTextElement{&slack.RichTextSection{Type: slack.RTESection, Elements: elems}},
+		}
+	}
+	plain := func(s string) slack.RichTextSectionElement {
+		return &slack.RichTextSectionTextElement{Type: slack.RTSEText, Text: s}
+	}
+	link := func(href, label string) slack.RichTextSectionElement {
+		return &slack.RichTextSectionLinkElement{Type: slack.RTSELink, URL: href, Text: label}
+	}
+	button := func(label, href string) slack.Block {
+		return &slack.ActionBlock{
+			Type: slack.MBTAction,
+			Elements: &slack.BlockElements{ElementSet: []slack.BlockElement{
+				&slack.ButtonBlockElement{Type: slack.METButton, Text: &slack.TextBlockObject{Type: "plain_text", Text: label}, URL: href},
+			}},
+		}
+	}
+	blocks := func(b ...slack.Block) slack.Blocks { return slack.Blocks{BlockSet: b} }
+
+	tests := []struct {
+		name   string
+		text   string
+		blocks slack.Blocks
+		want   string
+	}{
+		{
+			name: "no blocks keeps text",
+			text: "plain message",
+			want: "plain message",
+		},
+		{
+			name:   "empty text falls back to blocks",
+			blocks: blocks(section("from blocks")),
+			want:   "from blocks",
+		},
+		{
+			name:   "empty text renders rich text links with url",
+			blocks: blocks(richText(plain("see "), link("https://x.example", "docs"))),
+			want:   "see https://x.example - docs",
+		},
+		{
+			name:   "rich text only keeps text with mentions",
+			text:   "hi <@U1> see <https://x.example|docs>",
+			blocks: blocks(richText(plain("hi  see "), link("https://x.example", "docs"))),
+			want:   "hi <@U1> see https://x.example - docs",
+		},
+		{
+			name:   "rich text with a button keeps text and adds the link",
+			text:   "hi <@U1>",
+			blocks: blocks(richText(plain("hi ")), button("Open", "https://o.example")),
+			want:   "hi <@U1>\nhttps://o.example - Open",
+		},
+		{
+			name:   "fallback contained in blocks is not repeated",
+			text:   "Tom &amp; Jerry *started*",
+			blocks: blocks(section(":rocket: Tom & Jerry started"), section("Task CD-1")),
+			want:   ":rocket: Tom & Jerry started Task CD-1",
+		},
+		{
+			name:   "blocks contained in text keep text",
+			text:   "Deploy started for CD-1 by Robot",
+			blocks: blocks(section("Deploy started")),
+			want:   "Deploy started for CD-1 by Robot",
+		},
+		{
+			name:   "different text and blocks are both kept",
+			text:   "New alert",
+			blocks: blocks(section("CPU above 90%")),
+			want:   "New alert\nCPU above 90%",
+		},
+		{
+			name:   "emoji only text is kept",
+			text:   ":rotating_light: 🚨",
+			blocks: blocks(section("CPU high")),
+			want:   ":rotating_light: 🚨\nCPU high",
+		},
+		{
+			name:   "button without label shows url",
+			blocks: blocks(button("", "https://o.example")),
+			want:   "https://o.example",
+		},
+		{
+			name:   "link label and url with pipe and angle bracket stay intact",
+			blocks: blocks(button("Next >", "https://g.example/d?var-x=a|b")),
+			want:   "https://g.example/d?var-x=a|b - Next >",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ProcessText(MessageText(tt.text, tt.blocks)); got != tt.want {
+				t.Errorf("MessageText() = %q, want %q", got, tt.want)
 			}
 		})
 	}

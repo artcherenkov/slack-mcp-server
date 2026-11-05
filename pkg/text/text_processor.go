@@ -3,11 +3,13 @@ package text
 import (
 	"crypto/x509"
 	"fmt"
+	"html"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/slack-go/slack"
 	"go.uber.org/zap"
@@ -67,43 +69,146 @@ func AttachmentToText(att slack.Attachment) string {
 	return result
 }
 
-// BlocksToText extracts text content from Slack Block Kit structures.
-func BlocksToText(blocks slack.Blocks) string {
-	if len(blocks.BlockSet) == 0 {
-		return ""
+// MessageText returns the readable text of a message from its text field and
+// its Block Kit blocks.
+//
+// Apps usually put a one-line notification fallback into the text field and
+// the content into section, header, context and actions blocks, so those blocks
+// are added. Slack search, on the other hand, may return a text field already
+// built from the blocks. To avoid repeats, a block part is added only when the
+// text field does not contain it, and when the blocks as a whole contain the
+// text field, the blocks replace it. Parts are compared by letters and digits
+// only, so mrkdwn markup, emoji shortcodes and spacing do not matter.
+//
+// rich_text blocks are used only when the text field is empty: for messages
+// written in the Slack client they mirror the text field, which also keeps user
+// mentions that the rich_text conversion drops.
+func MessageText(msgText string, blocks slack.Blocks) string {
+	if msgText == "" {
+		return BlocksToText(blocks)
 	}
 
 	var parts []string
-
 	for _, block := range blocks.BlockSet {
-		switch b := block.(type) {
-		case *slack.HeaderBlock:
-			if b.Text != nil && b.Text.Text != "" {
-				parts = append(parts, b.Text.Text)
+		if _, ok := block.(*slack.RichTextBlock); ok {
+			continue
+		}
+		parts = append(parts, blockParts(block)...)
+	}
+
+	comparableText := lettersAndDigits(msgText)
+
+	var extra []string
+	for _, part := range parts {
+		if !strings.Contains(comparableText, lettersAndDigits(part)) {
+			extra = append(extra, part)
+		}
+	}
+	if len(extra) == 0 {
+		return msgText
+	}
+
+	blocksText := strings.Join(parts, " ")
+	if comparableText != "" && strings.Contains(lettersAndDigits(blocksText), comparableText) {
+		return blocksText
+	}
+
+	return msgText + "\n" + strings.Join(extra, " ")
+}
+
+// lettersAndDigits keeps only lowercased letters and digits of the unescaped
+// text. Slack escapes &, < and > in message text and mrkdwn but not in button
+// labels and URLs, so the text is unescaped first.
+func lettersAndDigits(s string) string {
+	var b strings.Builder
+	for _, r := range html.UnescapeString(s) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(unicode.ToLower(r))
+		}
+	}
+	return b.String()
+}
+
+// BlocksToText extracts text content from Slack Block Kit structures.
+func BlocksToText(blocks slack.Blocks) string {
+	var parts []string
+	for _, block := range blocks.BlockSet {
+		parts = append(parts, blockParts(block)...)
+	}
+
+	return strings.Join(parts, " ")
+}
+
+func blockParts(block slack.Block) []string {
+	var parts []string
+
+	switch b := block.(type) {
+	case *slack.HeaderBlock:
+		if b.Text != nil && b.Text.Text != "" {
+			parts = append(parts, b.Text.Text)
+		}
+	case *slack.SectionBlock:
+		if b.Text != nil && b.Text.Text != "" {
+			parts = append(parts, b.Text.Text)
+		}
+		for _, field := range b.Fields {
+			if field != nil && field.Text != "" {
+				parts = append(parts, field.Text)
 			}
-		case *slack.SectionBlock:
-			if b.Text != nil && b.Text.Text != "" {
-				parts = append(parts, b.Text.Text)
-			}
-			for _, field := range b.Fields {
-				if field != nil && field.Text != "" {
-					parts = append(parts, field.Text)
-				}
-			}
-		case *slack.RichTextBlock:
-			if t := richTextBlockToText(b); t != "" {
+		}
+		if b.Accessory != nil {
+			if t := buttonToText(b.Accessory.ButtonElement); t != "" {
 				parts = append(parts, t)
 			}
-		case *slack.ContextBlock:
-			for _, elem := range b.ContextElements.Elements {
-				if txt, ok := elem.(*slack.TextBlockObject); ok && txt != nil && txt.Text != "" {
-					parts = append(parts, txt.Text)
+		}
+	case *slack.ActionBlock:
+		if b.Elements == nil {
+			break
+		}
+		for _, elem := range b.Elements.ElementSet {
+			if button, ok := elem.(*slack.ButtonBlockElement); ok {
+				if t := buttonToText(button); t != "" {
+					parts = append(parts, t)
 				}
+			}
+		}
+	case *slack.RichTextBlock:
+		if t := richTextBlockToText(b); t != "" {
+			parts = append(parts, t)
+		}
+	case *slack.ContextBlock:
+		for _, elem := range b.ContextElements.Elements {
+			if txt, ok := elem.(*slack.TextBlockObject); ok && txt != nil && txt.Text != "" {
+				parts = append(parts, txt.Text)
 			}
 		}
 	}
 
-	return strings.Join(parts, " ")
+	return parts
+}
+
+// buttonToText renders a URL button as a link. Buttons without a URL only
+// trigger app actions and carry nothing a reader can follow, so they are skipped.
+func buttonToText(button *slack.ButtonBlockElement) string {
+	if button == nil || button.URL == "" {
+		return ""
+	}
+	label := ""
+	if button.Text != nil {
+		label = button.Text.Text
+	}
+	return linkText(button.URL, label)
+}
+
+// linkText renders a block link in the same "url - label" form that
+// ProcessText gives to <url|label> links in mrkdwn. It is not emitted as
+// <url|label>: block URLs and labels are not escaped, so a "|" or ">" in them
+// would break that syntax.
+func linkText(href, label string) string {
+	if label == "" || label == href {
+		return href
+	}
+	return href + " - " + label
 }
 
 // FilesToText extracts text metadata from email file attachments.
@@ -204,10 +309,10 @@ func richTextSectionToText(section *slack.RichTextSection) string {
 				parts = append(parts, e.Text)
 			}
 		case *slack.RichTextSectionLinkElement:
-			if e.Text != "" {
+			if e.URL != "" {
+				parts = append(parts, linkText(e.URL, e.Text))
+			} else if e.Text != "" {
 				parts = append(parts, e.Text)
-			} else if e.URL != "" {
-				parts = append(parts, e.URL)
 			}
 		case *slack.RichTextSectionBroadcastElement:
 			if e.Range != "" {
