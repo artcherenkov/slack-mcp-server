@@ -786,6 +786,11 @@ func TestProcessText_LinkNormalization(t *testing.T) {
 			expected: "First https://site1.com - Site One, then https://site2.com - Site Two, done",
 		},
 		{
+			name:     "Slack-style link URL is unescaped",
+			input:    "<https://grafana.example.com/d/1?var-x=a&amp;orgId=1|Grafana> and R&amp;D",
+			expected: "https://grafana.example.com/d/1?var-x=a&orgId=1 - Grafana, and R&amp;D",
+		},
+		{
 			name:     "Markdown link at end",
 			input:    "Check this [Google](https://google.com)",
 			expected: "Check this https://google.com - Google",

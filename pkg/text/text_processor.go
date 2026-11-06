@@ -472,6 +472,11 @@ var (
 	markdownLinkRegex = regexp.MustCompile(`\[([^\]]+)\]\((https?://[^)]+)\)`)
 	htmlLinkRegex     = regexp.MustCompile(`<a\s+href=["']([^"']+)["'][^>]*>([^<]+)</a>`)
 	inlineSpaceRegex  = regexp.MustCompile(`[ \t]+`)
+
+	// slackUnescaper undoes the escaping Slack applies to &, < and > in mrkdwn.
+	// A URL taken out of <url|label> keeps "&amp;" otherwise and breaks when
+	// followed. One pass, so "&amp;lt;" correctly becomes "&lt;".
+	slackUnescaper = strings.NewReplacer("&amp;", "&", "&lt;", "<", "&gt;", ">")
 )
 
 func normalizeLinks(text string) string {
@@ -494,7 +499,8 @@ func normalizeLinks(text string) string {
 
 	for _, match := range slackLinkRegex.FindAllStringSubmatch(text, -1) {
 		original := match[0]
-		text = strings.Replace(text, original, render(match[1], match[2], isLastInText(original, text)), 1)
+		href := slackUnescaper.Replace(match[1])
+		text = strings.Replace(text, original, render(href, match[2], isLastInText(original, text)), 1)
 	}
 
 	for _, match := range markdownLinkRegex.FindAllStringSubmatch(text, -1) {
